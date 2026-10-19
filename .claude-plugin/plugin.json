@@ -1,8 +1,10 @@
 {
   "name": "usage-limit-resume",
-  "version": "0.1.0",
-  "description": "세션 한도로 멈춘 백그라운드 작업(대기 중 백그라운드로 옮긴 대화형 포함)을 리셋 뒤 자동 재개한다 (Windows)",
+  "version": "0.2.0",
+  "description": "Auto-resume Claude Code background jobs stopped by the usage limit once it resets, including interactive sessions moved to the background while waiting (Windows, macOS)",
   "author": {
     "name": "Seokju Youn"
-  }
+  },
+  "repository": "https://github.com/JAVA-VARA/usage-limit-resume",
+  "license": "MIT"
 }

@@ -1,6 +1,6 @@
 {
-  "name": "seokju-local",
+  "name": "usage-limit-resume",
   "owner": { "name": "Seokju Youn" },
-  "metadata": { "description": "Seokju 개인용 Claude Code 플러그인" },
+  "metadata": { "description": "Auto-resume Claude Code jobs after the usage limit resets" },
   "plugins": [{ "name": "usage-limit-resume", "source": "./" }]
 }

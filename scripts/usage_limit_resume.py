@@ -2,8 +2,8 @@
 
 흐름
 1. StopFailure 훅(matcher: rate_limit)이 `hook` 으로 부른다. 멈춘 메시지의
-   "resets 1:40pm (Asia/Seoul)" 을 읽어 그 시각 + 여유분에 Windows 작업 스케줄러
-   1회 작업을 등록한다(훅 프로세스가 죽어도, 작업이 stop 되어도 살아남게).
+   "resets 1:40pm (Asia/Seoul)" 을 읽어 그 시각 + 여유분에 1회 예약을 건다
+   (Windows 작업 스케줄러, macOS launchd. 훅 프로세스가 죽어도, 작업이 stop 되어도 살아남게).
 2. 그 시각에 스케줄러가 `run` 을 부른다. ~/.claude/jobs/*/state.json 을 훑어
    "한도로 blocked" 이고 리셋 시각이 지난 작업만 골라 queuedPrompt 를 적고
    `claude respawn <id>` 로 같은 작업 ID 그대로 다시 띄운다.
@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import json
 import os
+import plistlib
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -39,17 +41,21 @@ HISTORY_PATH = STATE_DIR / "history.json"
 INTERACTIVE_PATH = STATE_DIR / "interactive.json"  # 한도에 걸린 대화형 세션
 PROJECTS_DIR = HOME / "projects"
 LOCK_PATH = STATE_DIR / "run.lock"
-CLAUDE_EXE = Path.home() / ".local" / "bin" / "claude.exe"
+CLAUDE_PATH_FILE = STATE_DIR / "claude_path.txt"  # 세션 안에서 찾은 claude 위치(스케줄러는 PATH 가 짧다)
+IS_WIN = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
 PYTHONW = Path(sys.executable).with_name("pythonw.exe")
 TASK_NAME = "ClaudeUsageLimitResume"
+LAUNCHD_PREFIX = "com.github.usage-limit-resume."  # 뒤에 예약 시각(YYYYmmddHHMM)을 붙인다
+LAUNCH_AGENTS = Path.home() / "Library" / "LaunchAgents"
 
 GRACE = timedelta(minutes=2)  # 리셋 직후 바로 부르면 아직 막혀 있을 수 있다
 FALLBACK_WAIT = timedelta(minutes=30)  # 리셋 시각을 못 읽었을 때
 MOVE_SETTLE = timedelta(minutes=2)  # 백그라운드로 옮긴 직후 작업이 스스로 남기는 기록은 무시
 MAX_RESUMES_PER_DAY = 3
 RESUME_PROMPT = (
-    "세션 한도가 풀려 자동으로 재개되었습니다. 멈추기 직전에 하던 작업을 확인하고 "
-    "이어서 진행해. (usage_limit_resume 훅이 보낸 메시지)"
+    "The usage limit has reset and this task was resumed automatically. Check what you were "
+    "doing right before it stopped and continue. (sent by the usage-limit-resume plugin)"
 )
 
 LIMIT_RE = re.compile(r"hit your .*limit", re.IGNORECASE)
@@ -272,9 +278,41 @@ def save_history(history: dict[str, list[float]]) -> None:
     HISTORY_PATH.write_text(json.dumps({k: v for k, v in history.items() if v}), encoding="utf-8")
 
 
+def remember_claude() -> None:
+    """세션 안(PATH 가 온전할 때)에서 찾은 claude 위치를 적어 둔다."""
+    found = shutil.which("claude")
+    if found:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        CLAUDE_PATH_FILE.write_text(found, encoding="utf-8")
+
+
+def find_claude() -> str | None:
+    """CLAUDE_BIN → PATH → 세션에서 적어 둔 위치 → 흔한 설치 위치 순으로 찾는다."""
+    try:
+        saved = CLAUDE_PATH_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        saved = None
+    local_bin = Path.home() / ".local" / "bin"
+    cands = [os.environ.get("CLAUDE_BIN"), shutil.which("claude"), saved,
+             str(local_bin / "claude.exe"), str(local_bin / "claude"),
+             "/opt/homebrew/bin/claude", "/usr/local/bin/claude"]
+    if IS_WIN and os.environ.get("APPDATA"):
+        cands.append(str(Path(os.environ["APPDATA"]) / "npm" / "claude.cmd"))
+    return next((c for c in cands if c and Path(c).is_file()), None)
+
+
 def schedule(at: datetime) -> bool:
-    """작업 스케줄러에 1회 작업을 (덮어)등록한다. 로캘에 상관없게 PowerShell 로 등록한다."""
     at_local = at.astimezone().replace(tzinfo=None)
+    if IS_MAC:
+        return schedule_mac(at_local)
+    if not IS_WIN:
+        log(f"schedule 건너뜀: 지원하지 않는 OS {sys.platform}")
+        return False
+    return schedule_win(at_local)
+
+
+def schedule_win(at_local: datetime) -> bool:
+    """작업 스케줄러에 1회 작업을 (덮어)등록한다. 로캘에 상관없게 PowerShell 로 등록한다."""
     script = Path(__file__).resolve()
     ps = (
         f"$a = New-ScheduledTaskAction -Execute '{PYTHONW}' -Argument '\"{script}\" run';"
@@ -293,11 +331,88 @@ def schedule(at: datetime) -> bool:
     return True
 
 
+def launchd_plist(label: str, at_local: datetime, script: Path) -> dict:
+    """at_local 에 1번 `run` 을 부르는 LaunchAgent. 잠자던 중이면 깨어난 직후 돈다."""
+    return {
+        "Label": label,
+        "ProgramArguments": [sys.executable, str(script), "run"],
+        "StartCalendarInterval": {"Month": at_local.month, "Day": at_local.day,
+                                  "Hour": at_local.hour, "Minute": at_local.minute},
+        # launchd 의 PATH 는 /usr/bin:/bin 뿐이라 npm 으로 깐 claude(node)를 못 찾는다
+        "EnvironmentVariables": {"PATH": os.environ.get("PATH", ""), "ULR_LABEL": label},
+        "AbandonProcessGroup": True,  # remove_launchd 가 띄운 지연 bootout 이 run 과 함께 죽지 않게
+        "StandardOutPath": str(STATE_DIR / "launchd.log"),
+        "StandardErrorPath": str(STATE_DIR / "launchd.log"),
+    }
+
+
+def remove_launchd(keep: set[str]) -> None:
+    """keep 밖의 예약을 내린다. 지금 도는 run 의 예약(ULR_LABEL)을 바로 내리면 launchd 가
+    이 프로세스까지 죽인다. 그래서 run 이 끝날 즈음 내리도록 분리된 프로세스에 맡긴다
+    (그대로 두면 StartCalendarInterval 에 연도가 없어 1년 뒤 같은 시각에 다시 돈다)."""
+    me = os.environ.get("ULR_LABEL")
+    for p in LAUNCH_AGENTS.glob(f"{LAUNCHD_PREFIX}*.plist"):
+        label = p.stem
+        if label in keep:
+            continue
+        target = f"gui/{os.getuid()}/{label}"
+        if label == me:
+            subprocess.Popen(["/bin/sh", "-c", f"sleep 5; launchctl bootout {target}"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        else:
+            subprocess.run(["launchctl", "bootout", target], capture_output=True, text=True, timeout=30)
+        p.unlink(missing_ok=True)
+
+
+def schedule_mac(at_local: datetime) -> bool:
+    label = LAUNCHD_PREFIX + at_local.strftime("%Y%m%d%H%M")
+    path = LAUNCH_AGENTS / f"{label}.plist"
+    remove_launchd(keep=set())
+    LAUNCH_AGENTS.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as f:
+        plistlib.dump(launchd_plist(label, at_local, Path(__file__).resolve()), f)
+    r = subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(path)],
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode != 0 and label != os.environ.get("ULR_LABEL"):
+        log(f"schedule 실패 {at_local}: {(r.stderr or r.stdout).strip()[:300]}")
+        return False
+    # 잠자는 Mac 을 깨우려면 root 가 필요하다. sudoers 에 pmset 을 허용해 둔 경우에만 된다(README)
+    w = subprocess.run(["sudo", "-n", "/usr/bin/pmset", "schedule", "wake",
+                        at_local.strftime("%m/%d/%y %H:%M:%S")],
+                       capture_output=True, text=True, timeout=30)
+    log(f"schedule {at_local} (wake {'예약' if w.returncode == 0 else '안 함'})")
+    return True
+
+
 def unschedule() -> None:
+    if IS_MAC:
+        remove_launchd(keep=set())
+        return
+    if not IS_WIN:
+        return
     subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
                     f"Unregister-ScheduledTask -TaskName '{TASK_NAME}' -Confirm:$false -ErrorAction SilentlyContinue"],
                    capture_output=True, text=True, timeout=60,
                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def next_scheduled() -> str:
+    if IS_MAC:
+        labels = sorted(p.stem for p in LAUNCH_AGENTS.glob(f"{LAUNCHD_PREFIX}*.plist"))
+        if not labels:
+            return ""
+        t = datetime.strptime(labels[0][len(LAUNCHD_PREFIX):], "%Y%m%d%H%M")
+        return t.strftime("%Y-%m-%d %H:%M")
+    if not IS_WIN:
+        return f"(지원하지 않는 OS: {sys.platform})"
+    r = subprocess.run(["powershell.exe", "-NoProfile", "-Command",
+                        f"(Get-ScheduledTask -TaskName '{TASK_NAME}' -ErrorAction SilentlyContinue | "
+                        "Get-ScheduledTaskInfo | Select-Object -ExpandProperty NextRunTime)"],
+                       capture_output=True, text=True, timeout=60,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return r.stdout.strip()
 
 
 def resume_job(job: dict) -> bool:
@@ -311,8 +426,11 @@ def resume_job(job: dict) -> bool:
     tmp = job["state_path"].with_suffix(".json.ulr-tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp, job["state_path"])
+    claude = find_claude()
     try:
-        r = subprocess.run([str(CLAUDE_EXE), "respawn", job["id"]],
+        if not claude:
+            raise FileNotFoundError("claude 를 찾지 못함(CLAUDE_BIN 으로 지정 가능)")
+        r = subprocess.run([claude, "respawn", job["id"]],
                            cwd=job["cwd"] if job["cwd"] and Path(job["cwd"]).is_dir() else None,
                            capture_output=True, text=True, encoding="utf-8", errors="replace",
                            timeout=180, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -390,6 +508,7 @@ def cmd_hook() -> int:
     msg = " ".join(str(payload.get(k) or "") for k in ("last_assistant_message", "error_details"))
     job_id = Path(os.environ["CLAUDE_JOB_DIR"]).name if os.environ.get("CLAUDE_JOB_DIR") else None
     log(f"hook error={payload.get('error')} job={job_id} session={payload.get('session_id')} msg={msg[:120]!r}")
+    remember_claude()
     now = datetime.now().astimezone()
     reset = parse_reset(msg, now) or (now + FALLBACK_WAIT)
     if not job_id:
@@ -411,11 +530,8 @@ def cmd_hook() -> int:
 
 def cmd_status() -> int:
     print(f"로그: {LOG_PATH}")
-    r = subprocess.run(["powershell.exe", "-NoProfile", "-Command",
-                        f"(Get-ScheduledTask -TaskName '{TASK_NAME}' -ErrorAction SilentlyContinue | "
-                        "Get-ScheduledTaskInfo | Select-Object -ExpandProperty NextRunTime)"],
-                       capture_output=True, text=True, timeout=60)
-    print(f"다음 예약: {r.stdout.strip() or '없음'}")
+    print(f"다음 예약: {next_scheduled() or '없음'}")
+    print(f"claude: {find_claude() or '못 찾음 — CLAUDE_BIN 환경변수로 지정'}")
     return cmd_run(dry=True)
 
 

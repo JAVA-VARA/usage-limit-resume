@@ -19,6 +19,17 @@ test('rate_limit 이면 스크립트에 hook 과 원래 입력을 넘긴다', as
   expect(JSON.parse(calls[0].stdin ?? '{}').last_assistant_message).toContain('resets 6:40pm')
 })
 
+test('python 이 없으면(9009) python3 로 다시 부른다', async ($, on) => {
+  const tried: string[] = []
+  on('process.run', async (_$, e) => {
+    tried.push(e.argv[0])
+    return { value: { exitCode: e.argv[0] === 'python' ? 9009 : 0, stdout: '', stderr: '' } }
+  })
+  on('classic.StopFailure', async () => ({}))
+  await $.classic.StopFailure({ error: 'rate_limit', last_assistant_message: 'resets 6:40pm' })
+  expect(tried).toEqual(['python', 'python3'])
+})
+
 test('다른 오류는 스크립트를 부르지 않는다', async ($, on) => {
   let ran = 0
   on('process.run', async () => {
