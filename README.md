@@ -14,7 +14,11 @@ Claude Code's built-in auto-continue (`autoContinueAtUsageLimit`) only covers in
 
 1. When a turn stops with `StopFailure` = `rate_limit`, the hook reads the reset time from the message ("resets 6:40pm (Asia/Seoul)") and schedules a one-shot task for 2 minutes after it: Windows Task Scheduler (`ClaudeUsageLimitResume`) or a macOS LaunchAgent (`com.github.usage-limit-resume.<time>`)
 2. At that time it finds jobs still blocked by the limit, queues a resume prompt into each, and runs `claude respawn <id>`
-3. Jobs you already continued by hand are left alone. The same job is auto-resumed at most 3 times in 24 hours
+3. It then checks each job's timeline for up to 60 seconds. A job that wrote nothing new after the respawn is logged as `unconfirmed`
+4. A failed or unconfirmed respawn is retried 10, then 20 minutes later
+5. Jobs you already continued by hand are left alone. The same job gets at most 3 attempts in 24 hours, failures included
+
+The scheduled task runs a copy of the script at `~/.claude/usage-limit-resume/runner.py`, not the versioned plugin cache path, so updating the plugin while a resume is pending is safe.
 
 ## Install
 
@@ -29,7 +33,25 @@ Requirements:
 - Python 3.9+ on `PATH` as `python` or `python3`
 - Claude Code with background jobs (`claude respawn`), tested on 2.1.30x. `claude` is found via `CLAUDE_BIN`, then `PATH`, then common install locations (native installer, Homebrew, npm)
 
-Check it from any session with `/usage-resume`: it shows the next scheduled run, the jobs it would resume, and which `claude` it will call. Log: `~/.claude/usage-limit-resume/log.txt`.
+Check it from any session:
+
+- `/usage-resume` shows the next scheduled run, the jobs it would resume, recent attempts, and which `claude` it will call
+- `/usage-resume doctor` checks the setup. It looks at Python and time zone data, `claude respawn`, and whether a task can be scheduled (it registers a test task a year ahead and removes it). It also checks folder access and the last run
+
+Files in `~/.claude/usage-limit-resume/`: `log.txt`, and `attempts.jsonl` (one line per attempt: `launched`, `resumed`, `unconfirmed`, `failed`). Bookkeeping: `history.json`, `retry.json`, `interactive.json`, `runner.py`.
+
+## Status
+
+"Supported" means the code handles the case and the automated tests cover it. "Verified" means it has been seen working on a real machine.
+
+| Scenario | Windows | macOS |
+|---|---|---|
+| Background job resumed after the limit resets | Verified (6 jobs, 2026-10-19) | Supported |
+| Interactive session moved to the background while waiting | Supported (replayed from a real 2026-10-16 transcript) | Supported |
+| Claude Code closed at the scheduled time | Supported (the task runs outside Claude Code) | Supported |
+| Machine asleep at the scheduled time | Verified (modern standby, AC) | Supported (`pmset` wake needs the sudoers step below) |
+| Machine powered off at the scheduled time | Supported (runs at next boot) | Not supported |
+| Plugin updated while a resume is pending | Supported | Supported |
 
 ### Optional: wake from sleep
 
@@ -51,6 +73,7 @@ sudo chmod 440 /etc/sudoers.d/usage-limit-resume
 ## Things to know
 
 - Each resume starts a new turn, so it **uses your usage allowance**. That is the point, but keep it in mind
+- `log.txt` and `attempts.jsonl` hold job names and the first part of the limit message. They stay on your machine; nothing is sent anywhere
 - It relies on Claude Code internals (`~/.claude/jobs/*/state.json` `queuedPrompt`, `claude respawn`, the transcript's `continued-in` record). A Claude Code update can break it. Check the log after updating
 - If the machine is **powered off** at the scheduled time: Windows runs it at the next boot; macOS skips it until the next limit hit schedules a new one
 - Linux is not supported (scheduling is skipped)
@@ -77,10 +100,14 @@ claude plugin marketplace add JAVA-VARA/usage-limit-resume
 claude plugin install usage-limit-resume@usage-limit-resume
 ```
 
-- 확인: 세션에서 `/usage-resume`, 로그는 `~/.claude/usage-limit-resume/log.txt`
+- 확인: 세션에서 `/usage-resume`. 설치·권한 점검은 `/usage-resume doctor`. 로그는 `~/.claude/usage-limit-resume/log.txt`, 시도별 결과는 `attempts.jsonl`
+- respawn 이 실패하거나, 띄운 뒤 60초 안에 작업이 아무 기록도 남기지 않으면 10분, 20분 뒤에 다시 시도합니다
+- 예약은 버전 번호가 든 플러그인 캐시가 아니라 `~/.claude/usage-limit-resume/runner.py` 사본을 부릅니다. 그래서 예약이 걸린 채 업데이트해도 안전합니다
+- 실기 검증 현황은 위 "Status" 표에 있습니다. macOS 는 아직 실기 시험 전입니다
 - 필요한 것: Python 3.9 이상(`python` 또는 `python3`), 백그라운드 작업을 지원하는 Claude Code(2.1.30x 에서 시험)
 - 절전 깨우기는 위 "Optional: wake from sleep" 의 명령을 한 번 실행합니다
 - 주의할 점:
-  - 재개하면 그만큼 사용량이 나갑니다. 같은 작업은 24시간에 3번까지만 재개합니다
+  - 재개하면 그만큼 사용량이 나갑니다. 같은 작업은 24시간에 3번까지만 시도합니다(실패 포함)
+  - 로그에 작업 이름과 한도 메시지 앞부분이 남습니다. 내 PC 밖으로 보내지 않습니다
   - Claude Code 내부 구조에 기대고 있어 업데이트 뒤 깨질 수 있습니다
   - Linux 는 지원하지 않습니다

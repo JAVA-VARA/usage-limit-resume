@@ -1,6 +1,6 @@
 {
   "name": "usage-limit-resume",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Auto-resume Claude Code background jobs stopped by the usage limit once it resets, including interactive sessions moved to the background while waiting (Windows, macOS)",
   "author": {
     "name": "Seokju Youn"

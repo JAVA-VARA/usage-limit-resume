@@ -1,0 +1,22 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+        python: ["3.9", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      # Windows 의 Python 에는 시간대 데이터가 없어 tzdata 를 함께 깐다(플러그인 자체는 없어도 PC 시간대로 동작)
+      - run: python -m pip install pytest tzdata
+      - run: python -m pytest -p no:cacheprovider

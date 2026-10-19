@@ -30,6 +30,17 @@ test('python 이 없으면(9009) python3 로 다시 부른다', async ($, on) =>
   expect(tried).toEqual(['python', 'python3'])
 })
 
+test('/usage-resume doctor 는 doctor 를, 인자가 없으면 status 를 부른다', async ($, on) => {
+  const subs: string[] = []
+  on('process.run', async (_$, e) => {
+    subs.push(e.argv[2])
+    return { value: { exitCode: 0, stdout: 'ok', stderr: '' } }
+  })
+  await $.command.run({ command: 'usage-resume', args: 'doctor' })
+  await $.command.run({ command: 'usage-resume', args: '' })
+  expect(subs).toEqual(['doctor', 'status'])
+})
+
 test('다른 오류는 스크립트를 부르지 않는다', async ($, on) => {
   let ran = 0
   on('process.run', async () => {

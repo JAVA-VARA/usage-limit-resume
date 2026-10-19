@@ -266,3 +266,25 @@ scripts/usage_limit_resume.py                   실제 로직(약 570줄, 표준
 - `state.json` 파일 잠금(D-3. 실제 충돌 사례가 나오기 전까지)
 - Linux 지원(D-1. 요청이 생기기 전까지)
 - 내장 autoContinue 를 대신하는 대화형 세션 재개. 내장 기능이 하는 일은 그대로 맡긴다
+
+---
+
+## 10. v0.3.0 진행 결과 (2026-10-19, 브랜치 `v0.3.0`)
+
+| ID | 결과 | 검증 |
+|---|---|---|
+| TEST-1·2·3·4·7·8 | pytest 스위트 추가(`tests/`, 52건). 가짜 `claude`, 임시 HOME, 가짜 시각 사용 | 테스트 전후 실제 `~/.claude/usage-limit-resume` 해시가 같음 |
+| FIX-1 | stdin 을 바이트로 읽어 UTF-8 로 디코딩 | cp949 로 연 stdin 에서 `·`·이모지가 깨지지 않음 |
+| FIX-2 | 실패하면 10→20분 뒤 재시도(`retry.json`). 실패도 24시간 3회에 셈 | 3회째 실패 뒤 예약 해제 |
+| FIX-3 | 예약은 `~/.claude/usage-limit-resume/runner.py` 사본을 부름 | 작업 스케줄러 명령·plist 에 플러그인 캐시 경로가 없음 |
+| FIX-4 | PowerShell 문자열의 `'` 를 `''` 로 | `O'Brien` 경로 |
+| **FIX-5 (새로 찾음)** | 옮겨진 대화형 작업이 그 자체로도 한도 차단이면 후보에 두 번 잡혔다. 두 번째 시도는 respawn 없이 끝나지만 `interactive.json` 의 원래 기록이 그 run 에서 지워지지 않았다. 이제 하나로 합치고, 재개가 확인되면 원래 기록도 지운다 | 재현 테스트 |
+| IMPROVE-1 | `attempts.jsonl`: `launched` → 60초 안에 timeline 에 막힘이 아닌 기록이 생기면 `resumed`, 없으면 `unconfirmed`(재시도 대상). 여러 작업을 모두 띄운 뒤 한 번에 확인한다 | 테스트 |
+| IMPROVE-2 | `/usage-resume doctor` | 이 PC 에서 11개 항목 모두 OK, 시험 예약 남지 않음 |
+| IMPROVE-3 | 작업마다 `history.json` 저장 | 중간 강제 종료 테스트 |
+| IMPROVE-4 | 대체 대기 30→60→120분 | 테스트 |
+| IMPROVE-5 | respawn 시간 초과 180→60초, 작업 스케줄러 제한 10→30분, lock 만료 31분 | 작업 10개 최악 시간 < 30분 |
+| CI | GitHub Actions: windows·macos × Python 3.9·3.12 | push 뒤 확인 |
+| README | "Status" 표로 지원과 실기 검증을 나눔 | |
+
+남은 것: TEST-5·6(실기), TEST-9(다음 실제 한도에서 `attempts.jsonl` 확인)

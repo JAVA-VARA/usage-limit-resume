@@ -46,14 +46,15 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'usage-resume',
-      description: 'Usage-limit auto-resume: show the next scheduled run and jobs to resume',
+      description: 'Usage-limit auto-resume: show the next scheduled run and jobs to resume (`doctor` checks the setup)',
     })
     return next(e)
   })
 
-  on('command.run', { command: 'usage-resume' }, async $ => {
+  on('command.run', { command: 'usage-resume' }, async ($, e) => {
+    const sub = (e.args ?? '').trim() === 'doctor' ? 'doctor' : 'status'
     try {
-      const r = await runPython($, ['status'], { timeoutMs: 90_000 })
+      const r = await runPython($, [sub], { timeoutMs: 90_000 })
       return { text: (r.stdout + r.stderr).trim() || '(출력 없음)' }
     } catch (err) {
       return { text: String(err) }
