@@ -1,0 +1,8 @@
+{
+  "name": "usage-limit-resume",
+  "version": "0.1.0",
+  "description": "세션 한도로 멈춘 백그라운드 작업(대기 중 백그라운드로 옮긴 대화형 포함)을 리셋 뒤 자동 재개한다 (Windows)",
+  "author": {
+    "name": "Seokju Youn"
+  }
+}

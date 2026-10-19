@@ -1,0 +1,6 @@
+{
+  "name": "seokju-local",
+  "owner": { "name": "Seokju Youn" },
+  "metadata": { "description": "Seokju 개인용 Claude Code 플러그인" },
+  "plugins": [{ "name": "usage-limit-resume", "source": "./" }]
+}
