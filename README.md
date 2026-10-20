@@ -33,6 +33,8 @@ Requirements:
 - Python 3.9+ on `PATH` as `python` or `python3`
 - Claude Code with background jobs (`claude respawn`), tested on 2.1.30x. `claude` is found via `CLAUDE_BIN`, then `PATH`, then common install locations (native installer, Homebrew, npm)
 
+The same marketplace also has [`context-guard`](plugins/context-guard/README.md), which hands large sessions off to a fresh one. It is a separate plugin; install it only if you want it.
+
 Check it from any session:
 
 - `/usage-resume` shows the next scheduled run, the jobs it would resume, recent attempts, and which `claude` it will call
@@ -100,6 +102,7 @@ claude plugin marketplace add JAVA-VARA/usage-limit-resume
 claude plugin install usage-limit-resume@usage-limit-resume
 ```
 
+- 같은 마켓플레이스에 큰 세션을 새 세션으로 넘기는 [`context-guard`](plugins/context-guard/README.md) 도 있습니다. 별도 플러그인이라 원할 때만 설치합니다
 - 확인: 세션에서 `/usage-resume`. 설치·권한 점검은 `/usage-resume doctor`. 로그는 `~/.claude/usage-limit-resume/log.txt`, 시도별 결과는 `attempts.jsonl`
 - respawn 이 실패하거나, 띄운 뒤 60초 안에 작업이 아무 기록도 남기지 않으면 10분, 20분 뒤에 다시 시도합니다
 - 예약은 버전 번호가 든 플러그인 캐시가 아니라 `~/.claude/usage-limit-resume/runner.py` 사본을 부릅니다. 그래서 예약이 걸린 채 업데이트해도 안전합니다

@@ -1,0 +1,10 @@
+{
+  "name": "context-guard",
+  "version": "0.1.0",
+  "description": "Stop Claude Code sessions from growing too large: warn, block once, and hand the work off to a fresh background session with an auto-written handoff prompt (Windows; partial macOS)",
+  "author": {
+    "name": "Seokju Youn"
+  },
+  "repository": "https://github.com/JAVA-VARA/usage-limit-resume",
+  "license": "MIT"
+}
