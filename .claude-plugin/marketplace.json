@@ -1,6 +1,19 @@
 {
   "name": "usage-limit-resume",
-  "owner": { "name": "Seokju Youn" },
-  "metadata": { "description": "Auto-resume Claude Code jobs after the usage limit resets" },
-  "plugins": [{ "name": "usage-limit-resume", "source": "./" }]
+  "owner": {
+    "name": "Seokju Youn"
+  },
+  "metadata": {
+    "description": "Claude Code session helpers: auto-resume after the usage limit, and context-size guard with automatic handoff"
+  },
+  "plugins": [
+    {
+      "name": "usage-limit-resume",
+      "source": "./"
+    },
+    {
+      "name": "context-guard",
+      "source": "./plugins/context-guard"
+    }
+  ]
 }
