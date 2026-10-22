@@ -19,7 +19,7 @@ Sending the same prompt again lets it through, and the session is not blocked ag
 When it blocks:
 
 1. It writes a handoff prompt from the transcript: session title, folder, branch, the last 5 requests, the last answer, the blocked prompt, and the transcript path. Saved to `~/.claude/context-guard/handoff/<session>.md`
-2. It starts a background session with that prompt (`claude --bg`)
+2. It starts a background session with that prompt (`claude --bg`) in the current folder. If that folder was never trusted (a subfolder you moved into), it retries in the folder the session was started from (`CLAUDE_PROJECT_DIR`); the handoff prompt names the real working folder
 3. Interactive session on Windows: it opens `claude attach <id>` in a new Windows Terminal tab. Otherwise it copies that command to the clipboard
 4. It closes the blocked session a few seconds later: the interactive process is ended (its transcript is already saved), a background job is stopped with `claude stop` (not `rm`, which would delete its worktree)
 

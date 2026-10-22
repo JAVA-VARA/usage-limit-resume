@@ -199,18 +199,29 @@ def save_handoff(lines: list[str], session_id: str, transcript: Path, prompt: st
 
 
 def spawn_session(text: str, cwd: str) -> str | None:
-    """이어받기 프롬프트로 백그라운드 새 세션을 띄우고 그 id 를 돌려준다. 실패하면 None."""
-    if not CFG["auto_spawn"] or not cwd or not Path(cwd).is_dir():
+    """이어받기 프롬프트로 백그라운드 새 세션을 띄우고 그 id 를 돌려준다. 실패하면 None.
+
+    작업 폴더가 신뢰 승인을 안 받은 하위 폴더면 `claude --bg` 가 "Workspace not trusted" 로 거절한다
+    (2026-10-22, 신뢰된 projects 에서 시작해 projects/assistant 로 옮겨 간 세션). 그때는 세션을 시작한
+    폴더(CLAUDE_PROJECT_DIR, 늘 신뢰됨)에서 다시 띄운다. 이어받기 프롬프트에 작업 폴더가 적혀 있다.
+    """
+    if not CFG["auto_spawn"]:
         return None
-    try:
-        done = subprocess.run(
-            ["claude", "--bg", text], cwd=cwd, env=clean_env(), capture_output=True, timeout=60,
-            encoding="utf-8", errors="replace",
-        )
-    except Exception:
-        return None
-    match = SPAWN_ID_RE.search(done.stdout or "")
-    return match.group(1) if done.returncode == 0 and match else None
+    candidates = [c for c in dict.fromkeys([cwd, os.environ.get("CLAUDE_PROJECT_DIR") or ""]) if c and Path(c).is_dir()]
+    for folder in candidates:
+        try:
+            done = subprocess.run(
+                ["claude", "--bg", text], cwd=folder, env=clean_env(), capture_output=True, timeout=60,
+                encoding="utf-8", errors="replace",
+            )
+        except Exception:
+            return None  # 시간 초과면 세션이 이미 떴을 수 있어 다른 폴더에서 또 띄우지 않는다
+        match = SPAWN_ID_RE.search(done.stdout or "")
+        if done.returncode == 0 and match:
+            return match.group(1)
+        if "not trusted" not in (done.stderr or ""):
+            return None
+    return None
 
 
 def open_attach_tab(new_id: str, cwd: str) -> bool:

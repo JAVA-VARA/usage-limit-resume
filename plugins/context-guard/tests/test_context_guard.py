@@ -270,6 +270,7 @@ def test_spawn_session_parses_id_and_cleans_env(cg, monkeypatch, tmp_path):
     spec.loader.exec_module(fresh)
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "parent")
     monkeypatch.setenv("CLAUDE_CODE_GIT_BASH_PATH", "keep")
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
     seen = {}
 
     def fake_run(args, **kw):
@@ -280,9 +281,48 @@ def test_spawn_session_parses_id_and_cleans_env(cg, monkeypatch, tmp_path):
     assert seen["args"] == ["claude", "--bg", "이어받기"]
     assert "CLAUDE_CODE_SESSION_ID" not in seen["env"] and seen["env"]["CLAUDE_CODE_GIT_BASH_PATH"] == "keep"
 
-    monkeypatch.setattr(subprocess, "run", lambda args, **kw: SimpleNamespace(returncode=1, stdout=""))
+    monkeypatch.setattr(subprocess, "run", lambda args, **kw: SimpleNamespace(returncode=1, stdout="", stderr=""))
     assert fresh.spawn_session("이어받기", str(tmp_path)) is None
     assert fresh.spawn_session("이어받기", str(tmp_path / "없음")) is None
+
+
+def test_spawn_session_falls_back_to_project_dir(cg, monkeypatch, tmp_path):
+    spec = importlib.util.spec_from_file_location("context_guard_fresh", SCRIPT)
+    fresh = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fresh)
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+    tried = []
+
+    def fake_run(args, **kw):
+        tried.append(kw["cwd"])
+        if kw["cwd"] == str(sub):
+            return SimpleNamespace(returncode=1, stdout="", stderr="Workspace not trusted. Run `claude` in ...")
+        return SimpleNamespace(returncode=0, stdout="backgrounded · 1a2b3c4d\n", stderr="")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert fresh.spawn_session("이어받기", str(sub)) == "1a2b3c4d"
+    assert tried == [str(sub), str(tmp_path)]
+
+    # 신뢰 거절이 아닌 실패는 다른 폴더에서 다시 띄우지 않는다(세션이 둘 생길 수 있다)
+    tried.clear()
+    monkeypatch.setattr(subprocess, "run", lambda args, **kw: tried.append(kw["cwd"]) or SimpleNamespace(returncode=1, stdout="", stderr="boom"))
+    assert fresh.spawn_session("이어받기", str(sub)) is None
+    assert tried == [str(sub)]
+
+    def timeout_run(args, **kw):
+        tried.append(kw["cwd"])
+        raise subprocess.TimeoutExpired(args, 60)
+    tried.clear()
+    monkeypatch.setattr(subprocess, "run", timeout_run)
+    assert fresh.spawn_session("이어받기", str(sub)) is None
+    assert tried == [str(sub)]
+
+    # 작업 폴더가 곧 시작 폴더면 한 번만 시도한다
+    tried.clear()
+    monkeypatch.setattr(subprocess, "run", lambda args, **kw: tried.append(kw["cwd"]) or SimpleNamespace(returncode=1, stdout="", stderr=""))
+    assert fresh.spawn_session("이어받기", str(tmp_path)) is None
+    assert tried == [str(tmp_path)]
 
 
 def test_old_idle_uses_assistant_time(cg, monkeypatch, capsys, tmp_path):
