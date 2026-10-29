@@ -388,9 +388,16 @@ def decide(prompt: str, tokens: int, idle: float | None, state: dict) -> tuple[s
     return "block", f"[context-guard] {reason}.", {**state, "blocked_digest": digest}
 
 
+def read_payload() -> dict:
+    """훅 입력 JSON. Windows 는 stdin 기본 인코딩이 cp949 라 한글 프롬프트가 깨지므로(2026-10-29 "진행"→"吏꾪뻾")
+    바이트로 읽어 UTF-8 로 푼다."""
+    stream = getattr(sys.stdin, "buffer", None)
+    return json.loads(stream.read().decode("utf-8") if stream else sys.stdin.read())
+
+
 def main() -> None:
     CFG.update(load_config())
-    payload = json.load(sys.stdin)
+    payload = read_payload()
     transcript = Path(payload.get("transcript_path") or "")
     session_id = payload.get("session_id") or ""
     if not session_id or not transcript.is_file():

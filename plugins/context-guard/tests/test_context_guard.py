@@ -172,6 +172,16 @@ def test_main_block_without_spawn_shows_handoff(cg, monkeypatch, capsys, tmp_pat
     assert run_main(cg, monkeypatch, capsys, t, "다음 단계") == {}
 
 
+def test_main_reads_stdin_as_utf8_even_if_console_is_cp949(cg, monkeypatch, capsys, tmp_path):
+    t = write_transcript(tmp_path / "t.jsonl", [user("첫 요청"), assistant(160_000, "직전 답")])
+    payload = {"transcript_path": str(t), "session_id": "s1", "prompt": "인코딩 확인 요청", "cwd": str(tmp_path)}
+    raw = io.BytesIO(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(raw, encoding="cp949"))
+    cg.main()
+    assert json.loads(capsys.readouterr().out)["decision"] == "block"
+    assert "인코딩 확인 요청" in (cg.HANDOFF_DIR / "s1.md").read_text(encoding="utf-8")
+
+
 def test_main_warn_and_pass(cg, monkeypatch, capsys, tmp_path):
     t = write_transcript(tmp_path / "t.jsonl", [assistant(130_000)])
     assert "systemMessage" in run_main(cg, monkeypatch, capsys, t, "질문")
