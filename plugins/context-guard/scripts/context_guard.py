@@ -16,8 +16,14 @@
 1. 이어받기 프롬프트(세션명·폴더·브랜치·최근 요청·직전 답변·막힌 요청)를 만들어 `handoff/<session>.md` 에 저장한다
 2. 그 프롬프트로 백그라운드 새 세션(`claude --bg`)을 띄운다
 3. 대화형 세션이면 Windows Terminal 새 탭에서 `claude attach <id>` 를 연다(못 열면 그 명령을 클립보드에 복사)
-4. 막힌 세션을 몇 초 뒤 닫는다(대화형은 프로세스 종료, 백그라운드 작업은 `claude stop`)
+4. 막힌 세션을 몇 초 뒤 닫는다(대화형은 프로세스 종료, 백그라운드 작업은 `retire`)
 새 세션을 못 띄우면 이어받기 프롬프트 자체를 클립보드에 복사하고 차단 메시지에 보여 준다.
+
+백그라운드 작업 정리(`retire`·`sweep` 하위 명령)
+- `retire <id>`: `claude stop` 뒤 세션명 앞에 `[삭제예정]` 을 붙이고 삭제 대기 목록(`pending_rm.json`)에 적는다
+- `sweep`: 작업 스케줄러가 매시 부르고 KST sweep_hours 에만 돈다. 멈춘(done) 작업 중 워크트리가 없어진 것만
+  `claude rm` 한다. `rm` 은 워크트리까지 지우는데 새 세션이 같은 워크트리를 이어 쓰므로, `/land` 등으로
+  워크트리가 사라질 때까지 기다린다. `sweep --now` 는 시각과 상관없이 바로 돈다
 
 설정은 `~/.claude/context-guard/config.json` 으로 덮어쓴다(DEFAULTS 의 키). 플러그인 파일은 업데이트 때 덮어써진다.
 실패해도 프롬프트를 막지 않는다. 어떤 예외든 조용히 0 으로 끝난다.
@@ -30,12 +36,21 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime, timezone
+import shutil
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 STATE_DIR = Path.home() / ".claude" / "context-guard"
 HANDOFF_DIR = STATE_DIR / "handoff"
 CONFIG_PATH = STATE_DIR / "config.json"
+PENDING_PATH = STATE_DIR / "pending_rm.json"
+SWEEP_LOG = STATE_DIR / "sweep.log"
+RUNNER_PATH = STATE_DIR / "context_guard_runner.py"  # 플러그인 업데이트로 캐시 경로가 바뀌어도 예약 작업이 돌게 사본을 둔다
+JOBS_DIR = Path(os.environ.get("CLAUDE_JOBS_DIR") or Path.home() / ".claude" / "jobs")
+SWEEP_TASK = "ContextGuardSweep"
+RETIRE_MARK = "[삭제예정] "
+KST = timezone(timedelta(hours=9))
 # 다른 훅이 세션명을 적어 두는 곳(있으면 이어받기 프롬프트에 넣는다)
 TITLE_DIR = Path.home() / ".claude" / "session-titles"
 TAIL_BYTES = 4 * 1024 * 1024
@@ -63,6 +78,8 @@ DEFAULTS: dict = {
     "close_delay_seconds": 3,
     "parent_name": "claude",  # 닫기 전에 부모 프로세스 이름에 이 낱말이 있는지 확인한다
     "busy_words": ["codex"],  # 세션 아래 이 낱말이 든 프로세스가 있으면 막지 않는다
+    # 삭제 대기 작업을 확인하는 KST 시각. 근무 시간(9~18시)은 매시, 그 밖은 8시간마다(18 → 2 → 다음 날 9)
+    "sweep_hours": [2, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
 }
 CFG: dict = dict(DEFAULTS)
 
@@ -328,13 +345,170 @@ def close_old_session(tab_opened: bool) -> bool:
         return False
     job_dir = os.environ.get("CLAUDE_JOB_DIR")
     if job_dir:
-        return schedule_close(["claude", "stop", Path(job_dir).name])
+        return start_retire(Path(job_dir).name)
     pid = os.environ.get("CLAUDE_PID") or ""
     if not tab_opened or not pid.isdigit() or not parent_matches(pid):
         return False
     if sys.platform == "win32":
         return schedule_close(["Stop-Process", "-Id", pid, "-Force"])
     return schedule_close(["kill", pid])
+
+
+def start_retire(job_id: str) -> bool:
+    """훅이 먼저 끝나야 차단 메시지가 나가므로 `retire` 를 분리된 프로세스로 띄운다."""
+    try:
+        flags = (subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP) if sys.platform == "win32" else 0
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "retire", job_id], env=clean_env(), creationflags=flags,
+            start_new_session=sys.platform != "win32",
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def log(message: str) -> None:
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with SWEEP_LOG.open("a", encoding="utf-8") as f:
+            f.write(f"{datetime.now(KST).isoformat(timespec='seconds')} {message}\n")
+    except OSError:
+        pass
+
+
+def load_pending() -> dict:
+    try:
+        data = json.loads(PENDING_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_pending(pending: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    PENDING_PATH.write_text(json.dumps(pending, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def job_state(job_id: str) -> dict | None:
+    try:
+        data = json.loads((JOBS_DIR / job_id / "state.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def mark_retired(job_id: str) -> bool:
+    """멈춘 작업의 세션명 앞에 [삭제예정] 을 붙인다. 이미 붙어 있으면 그대로 둔다.
+
+    CLI 에 이름을 바꾸는 명령이 없어 state.json 의 name 을 고친다. 멈춘 작업은 이 파일을 더 쓰지 않는다.
+    """
+    state = job_state(job_id)
+    if state is None or state.get("state") != "done":
+        return False
+    name = str(state.get("name") or job_id)
+    if name.startswith(RETIRE_MARK):
+        return True
+    state["name"] = RETIRE_MARK + name
+    path = JOBS_DIR / job_id / "state.json"
+    tmp = path.with_suffix(".tmp")
+    try:
+        tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:  # 잠긴 파일 하나 때문에 나머지 정리가 멈추지 않게 한다
+        log(f"이름 표시 실패 {job_id}: {exc}")
+        return False
+    return True
+
+
+def run_claude(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["claude", *args], env=clean_env(), capture_output=True, timeout=120, encoding="utf-8", errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+
+
+def retire(job_id: str) -> None:
+    """막힌 백그라운드 작업을 멈추고 [삭제예정] 을 붙여 삭제 대기 목록에 올린다."""
+    time.sleep(int(CFG["close_delay_seconds"]))
+    run_claude("stop", job_id)
+    for _ in range(30):  # stop 이 state.json 을 done 으로 바꿀 때까지 기다린다
+        if (job_state(job_id) or {}).get("state") == "done":
+            break
+        time.sleep(1)
+    marked = mark_retired(job_id)
+    pending = load_pending()
+    pending[job_id] = {"retired_at": datetime.now(KST).isoformat(timespec="seconds")}
+    save_pending(pending)
+    log(f"retire {job_id} (이름 표시 {'함' if marked else '못 함'})")
+    ensure_sweep_task()
+
+
+def should_sweep(now: datetime) -> bool:
+    return now.astimezone(KST).hour in CFG["sweep_hours"]
+
+
+def sweep(now: datetime | None = None, force: bool = False) -> None:
+    """삭제 대기 작업 중 멈춘 채로 워크트리가 없어진 것을 `claude rm` 한다."""
+    if not force and not should_sweep(now or datetime.now(timezone.utc)):
+        return
+    pending = load_pending()
+    for job_id in list(pending):
+        state = job_state(job_id)
+        if state is None:
+            pending.pop(job_id)  # 사용자가 이미 지웠다
+            continue
+        if state.get("state") != "done":
+            continue  # 다시 attach 해서 이어 쓰는 중이면 건드리지 않는다
+        mark_retired(job_id)  # 이름이 되돌려졌으면 다시 붙인다
+        tree = state.get("worktreePath")
+        if tree and Path(tree).exists():
+            continue  # 새 세션이 같은 워크트리를 쓰고 있을 수 있다
+        done = run_claude("rm", job_id)
+        if done.returncode == 0:
+            pending.pop(job_id)
+            log(f"rm {job_id}")
+        else:
+            log(f"rm 실패 {job_id}: {(done.stderr or done.stdout or '').strip()[:300]}")
+    save_pending(pending)
+
+
+def ps_quote(value: object) -> str:
+    """PowerShell 작은따옴표 문자열. 안의 ' 는 '' 로 쓴다."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def sweep_task_command(python: Path, script: Path) -> str:
+    """오늘 0시부터 매시 `sweep` 을 부르는 작업 스케줄러 작업을 (덮어)등록하는 PowerShell."""
+    argument = f'"{script}" sweep'
+    return (
+        f"$a = New-ScheduledTaskAction -Execute {ps_quote(python)} -Argument {ps_quote(argument)};"
+        "$t = New-ScheduledTaskTrigger -Once -At ([datetime]::Today) -RepetitionInterval (New-TimeSpan -Hours 1);"
+        "$s = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries "
+        "-ExecutionTimeLimit (New-TimeSpan -Minutes 10);"
+        f"Register-ScheduledTask -TaskName {ps_quote(SWEEP_TASK)} -Action $a -Trigger $t -Settings $s -Force | Out-Null"
+    )
+
+
+def ensure_sweep_task() -> None:
+    """스크립트 사본을 고정 경로에 두고 sweep 예약 작업을 등록한다(Windows 만. 다른 OS 는 `sweep` 을 직접 부른다)."""
+    if sys.platform != "win32":
+        return
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        if Path(__file__).resolve() != RUNNER_PATH.resolve():
+            shutil.copyfile(Path(__file__).resolve(), RUNNER_PATH)
+        pythonw = Path(sys.executable).with_name("pythonw.exe")  # 매시 콘솔 창이 깜빡이지 않게
+        python = pythonw if pythonw.is_file() else Path(sys.executable)
+        done = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", sweep_task_command(python, RUNNER_PATH)],
+            capture_output=True, timeout=60, encoding="utf-8", errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if done.returncode != 0:
+            log(f"예약 작업 등록 실패: {done.stderr.strip()[:300]}")
+    except Exception as exc:
+        log(f"예약 작업 등록 실패: {exc}")
 
 
 def block_message(header: str, handoff: tuple[str, Path] | None, cwd: str) -> str:
@@ -427,8 +601,17 @@ def main() -> None:
 
 if __name__ == "__main__":
     try:
-        sys.stdout.reconfigure(encoding="utf-8")  # Windows 기본 cp949 로는 한글이 깨진다
-        main()
-    except Exception:
-        pass
+        if sys.stdout:  # 예약 작업은 pythonw 로 돌아 stdout 이 없다
+            sys.stdout.reconfigure(encoding="utf-8")  # Windows 기본 cp949 로는 한글이 깨진다
+        if sys.argv[1:2] == ["retire"] and len(sys.argv) > 2:
+            CFG.update(load_config())
+            retire(sys.argv[2])
+        elif sys.argv[1:2] == ["sweep"]:
+            CFG.update(load_config())
+            sweep(force="--now" in sys.argv)
+        else:
+            main()
+    except Exception as exc:
+        if sys.argv[1:2]:
+            log(f"{sys.argv[1]} 실패: {exc}")
     sys.exit(0)

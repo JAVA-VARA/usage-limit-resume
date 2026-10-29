@@ -25,6 +25,12 @@ def cg(tmp_path, monkeypatch):
     mod.HANDOFF_DIR = mod.STATE_DIR / "handoff"
     mod.CONFIG_PATH = mod.STATE_DIR / "config.json"
     mod.TITLE_DIR = tmp_path / "titles"
+    mod.PENDING_PATH = mod.STATE_DIR / "pending_rm.json"
+    mod.SWEEP_LOG = mod.STATE_DIR / "sweep.log"
+    mod.RUNNER_PATH = mod.STATE_DIR / "context_guard_runner.py"
+    mod.JOBS_DIR = tmp_path / "jobs"
+    mod.ensure_sweep_task = lambda: None
+    mod.time.sleep = lambda seconds: None
     # 실제 클립보드·프로세스·새 세션에 닿지 않게 기본으로 막아 둔다
     mod.copy_to_clipboard = lambda text: False
     mod.list_processes = lambda: []
@@ -248,12 +254,116 @@ def test_has_busy_children_fails_safe(cg):
     assert cg.has_busy_children("1") is True
 
 
-def test_close_background_job_stops_it(cg, monkeypatch):
+def test_close_background_job_retires_it(cg, monkeypatch):
     monkeypatch.setenv("CLAUDE_JOB_DIR", str(Path("jobs") / "ab12cd34"))
     seen = []
-    cg.schedule_close = lambda action: seen.append(action) or True
+    cg.start_retire = lambda job_id: seen.append(job_id) or True
     assert cg.close_old_session(tab_opened=False) is True
-    assert seen == [["claude", "stop", "ab12cd34"]]
+    assert seen == ["ab12cd34"]
+
+
+# --- 삭제 대기 작업 정리(retire·sweep) ------------------------------------------
+
+def write_job(cg, job_id: str, **state) -> Path:
+    folder = cg.JOBS_DIR / job_id
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / "state.json"
+    path.write_text(json.dumps({"state": "done", "name": "작업 이름", **state}, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def fake_claude(cg, returncode: int = 0) -> list:
+    calls = []
+    cg.run_claude = lambda *args: calls.append(args) or SimpleNamespace(returncode=returncode, stdout="", stderr="오류")
+    return calls
+
+
+def test_retire_stops_marks_and_queues(cg):
+    path = write_job(cg, "ab12cd34")
+    calls = fake_claude(cg)
+    cg.retire("ab12cd34")
+    cg.retire("ab12cd34")  # 두 번 불러도 표시는 한 번만
+    assert calls[0] == ("stop", "ab12cd34")
+    assert json.loads(path.read_text(encoding="utf-8"))["name"] == "[삭제예정] 작업 이름"
+    assert "ab12cd34" in cg.load_pending()
+
+
+def test_mark_retired_skips_running_job(cg):
+    path = write_job(cg, "ab12cd34", state="working")
+    assert cg.mark_retired("ab12cd34") is False
+    assert json.loads(path.read_text(encoding="utf-8"))["name"] == "작업 이름"
+
+
+@pytest.mark.parametrize("hour, expected", [(2, True), (8, False), (9, True), (18, True), (19, False), (1, False)])
+def test_should_sweep_follows_kst_hours(cg, hour, expected):
+    now = datetime(2026, 10, 29, hour, 30, tzinfo=cg.KST)
+    assert cg.should_sweep(now.astimezone(timezone.utc)) is expected
+
+
+def test_sweep_outside_hours_does_nothing(cg):
+    write_job(cg, "ab12cd34")
+    cg.save_pending({"ab12cd34": {}})
+    calls = fake_claude(cg)
+    cg.sweep(datetime(2026, 10, 29, 20, 0, tzinfo=cg.KST))
+    assert calls == [] and "ab12cd34" in cg.load_pending()
+
+
+def test_sweep_removes_only_stopped_jobs_without_worktree(cg, tmp_path):
+    live_tree = tmp_path / "tree"
+    live_tree.mkdir()
+    write_job(cg, "gone0001", worktreePath=str(tmp_path / "landed"))
+    write_job(cg, "none0002")
+    write_job(cg, "tree0003", worktreePath=str(live_tree))
+    write_job(cg, "busy0004", state="working")
+    cg.save_pending({k: {} for k in ("gone0001", "none0002", "tree0003", "busy0004", "lost0005")})
+    calls = fake_claude(cg)
+    cg.sweep(force=True)
+    assert sorted(calls) == [("rm", "gone0001"), ("rm", "none0002")]
+    assert set(cg.load_pending()) == {"tree0003", "busy0004"}
+    tree_state = json.loads((cg.JOBS_DIR / "tree0003" / "state.json").read_text(encoding="utf-8"))
+    assert tree_state["name"].startswith("[삭제예정] ")
+
+
+def test_sweep_keeps_job_when_rm_fails(cg):
+    write_job(cg, "ab12cd34")
+    cg.save_pending({"ab12cd34": {}})
+    fake_claude(cg, returncode=1)
+    cg.sweep(force=True)
+    assert "ab12cd34" in cg.load_pending()
+    assert "rm 실패 ab12cd34" in cg.SWEEP_LOG.read_text(encoding="utf-8")
+
+
+def test_sweep_continues_when_state_file_is_locked(cg, monkeypatch):
+    write_job(cg, "lock0001", name="이름")
+    write_job(cg, "gone0002")
+    cg.save_pending({"lock0001": {}, "gone0002": {}})
+    calls = fake_claude(cg)
+    real_replace = cg.os.replace
+    def locked(src, dst):
+        if "lock0001" in str(dst):
+            raise PermissionError("locked")
+        return real_replace(src, dst)
+    monkeypatch.setattr(cg.os, "replace", locked)
+    cg.sweep(force=True)
+    assert sorted(calls) == [("rm", "gone0002"), ("rm", "lock0001")]
+    assert cg.load_pending() == {}
+
+
+def test_cli_sweep_runs_without_stdout(tmp_path):
+    env = {**__import__("os").environ, "USERPROFILE": str(tmp_path), "HOME": str(tmp_path), "CLAUDE_JOBS_DIR": str(tmp_path / "jobs")}
+    code = "import sys, runpy; sys.stdout = None; sys.argv = [sys.argv[0], 'sweep', '--now']; runpy.run_path(sys.argv[0], run_name='__main__')"
+    done = subprocess.run([sys.executable, "-c", code.replace("sys.argv[0]", repr(str(SCRIPT)))], env=env, capture_output=True)
+    assert done.returncode == 0
+    log = tmp_path / ".claude" / "context-guard" / "sweep.log"
+    assert not log.exists() or "실패" not in log.read_text(encoding="utf-8")
+
+
+def test_sweep_task_command_runs_hourly_with_quoted_paths(cg):
+    runner = Path("C:/Users/O'Brien/runner.py")
+    command = cg.sweep_task_command(Path("C:/Py/pythonw.exe"), runner)
+    assert "-RepetitionInterval (New-TimeSpan -Hours 1)" in command
+    assert "'\"" + str(runner).replace("'", "''") + "\" sweep'" in command
+    assert "-TaskName 'ContextGuardSweep'" in command
 
 
 def test_close_interactive_needs_tab_and_matching_parent(cg, monkeypatch):
