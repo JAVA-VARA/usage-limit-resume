@@ -270,6 +270,12 @@ def find_moved_interactive_jobs(now: datetime, prune: bool) -> tuple[list[dict],
         due = parse_iso(e.get("due"))
         if not hit_at or not due or now - due > timedelta(hours=24):
             continue  # 오래된 기록은 버린다
+        if e.get("kind") == "lead":
+            if not isinstance(e.get("cwd"), str):
+                continue
+            keep[sid] = e
+            found.append({"id": sid, "name": "총괄", "kind": "lead", "cwd": e["cwd"], "due": due})
+            continue
         transcript = find_transcript(sid, e.get("transcript"))
         moved = moved_to_background(transcript, hit_at) if transcript else None
         if not moved:
@@ -547,6 +553,9 @@ def clear_queued(state_path: Path) -> None:
 
 def resume_job(job: dict) -> str | None:
     """queuedPrompt 를 적고 respawn 한다. 'launched'·'failed', 그 사이 상태가 바뀌었으면 None."""
+    if job["kind"] == "lead":
+        result = lead_event(job["cwd"], {"session_id": job["id"]}, resume=True)
+        return "resumed" if result is not None else "failed"
     state = read_json(job["state_path"])
     if job["kind"] == "interactive":
         if state.get("queuedPrompt") or touched_after(job["state_path"].parent, job["cancelled_at"]):
@@ -643,7 +652,12 @@ def cmd_run(dry: bool = False) -> int:
             history.setdefault(job["id"], []).append(time.time())
             save_history(history)  # 중간에 끊겨도 상한 기록은 남게
             record_attempt(job, result)
-            if result == "launched":
+            if result == "resumed":
+                entries = load_interactive()
+                entries.pop(job["id"], None)
+                save_interactive(entries)
+                retry.pop(job["id"], None)
+            elif result == "launched":
                 launched.append((job, started))
             else:
                 at = plan_retry(job, history, retry, now)
@@ -687,6 +701,25 @@ def read_hook_payload() -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def lead_event(cwd: str | None, payload: dict, *, resume: bool = False) -> dict | None:
+    """프로젝트가 제공한 어댑터만 호출한다. 없는 프로젝트·실행자는 기존 경로다."""
+    if not isinstance(cwd, str) or not cwd:
+        return None
+    script = Path(cwd) / "scripts/lead_control.py"
+    if not script.is_file():
+        return None
+    try:
+        result = subprocess.run([sys.executable, str(script), "--event", "resume" if resume else "rate_limit", cwd],
+                                input=json.dumps(payload, ensure_ascii=False), capture_output=True,
+                                text=True, encoding="utf-8", timeout=30,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        value = json.loads(result.stdout) if result.returncode == 0 else None
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        log(f"lead adapter failed: {type(error).__name__}")
+        return None
+
+
 def cmd_hook() -> int:
     payload = read_hook_payload()
     msg = " ".join(str(payload.get(k) or "") for k in ("last_assistant_message", "error_details"))
@@ -696,7 +729,13 @@ def cmd_hook() -> int:
     now = datetime.now().astimezone()
     history = load_history()
     reset = parse_reset(msg, now) or (now + fallback_wait(len(history.get(job_id or "", []))))
-    if not job_id:
+    lead = lead_event(payload.get("cwd"), payload)
+    if lead and lead.get("lead"):
+        sid = payload["session_id"]
+        entries = load_interactive()
+        entries[sid] = {"kind": "lead", "cwd": payload["cwd"], "hit_at": now.isoformat(), "due": (reset + GRACE).isoformat()}
+        save_interactive(entries)
+    elif not job_id:
         # 대화형은 내장 기능이 맡지만, 백그라운드로 옮기면 취소되므로 적어 두고 run 이 확인한다
         sid = payload.get("session_id")
         if not sid:
